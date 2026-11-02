@@ -39,13 +39,17 @@ $ python3 timemachine.py --at -- -2d     # relative jumps: ±N[smhdwy]
   speaks the JSON protocol over a plain TCP socket (no `gps` package), reads
   TPV messages, and compares satellite-derived time against the NTP consensus.
   No gpsd → one line noting the cross-check is unavailable, and it continues.
-- **Time scales** for the consensus instant: UTC, local, TAI (UTC+37),
-  GPS week + time-of-week (UTC+18, plus legacy mod-1024 week), Unix seconds
+- **Time scales** for the consensus instant: UTC, local, TAI, GPS week +
+  time-of-week (plus legacy mod-1024 week), Unix seconds
   and nanoseconds, NTP timestamp (1900 epoch, decimal and 32.32 hex),
   Julian Date, Modified JD, Greenwich Mean Sidereal Time, Swatch .beats,
-  day-of-year, and ISO week date. Leap-second constants live at the top of
-  the file with a note that they only change on IERS Bulletin C and bump
-  together (TAI−GPS is pinned at 19 s).
+  day-of-year, and ISO week date. TAI−UTC and GPS−UTC come from the full
+  leap-second history (1972 onward) at the top of the file, so time travel is
+  accurate: on 2015-10-21 TAI was UTC+36 s, not today's +37 s. Before 1972
+  (no integer TAI−UTC) and before the GPS epoch those scales show as n/a.
+  TAI−GPS is pinned at 19 s.
+- **NTP era-aware**: timestamps are decoded relative to the local clock, so
+  the client keeps working past the 2036-02-07 NTP era rollover.
 - **Watch mode** (`--watch N`): tracks min/max/mean offset and estimates the
   drift rate in ppm by linear regression of offset against `time.monotonic()`
   — so a stepped system clock can't poison the fit. Ctrl-C prints the session
