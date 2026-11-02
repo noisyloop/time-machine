@@ -38,10 +38,63 @@ __version__ = "1.0.0"
 # TAI-19 at the GPS epoch in 1980 and never leaps), so
 #     GPS_MINUS_UTC == TAI_MINUS_UTC - 19   at all times.
 # Last change: 2017-01-01 (Bulletin C 52). If a new leap second is announced,
-# bump TAI_MINUS_UTC and GPS_MINUS_UTC follows automatically.
+# append it to LEAP_SECONDS; TAI_MINUS_UTC and GPS_MINUS_UTC follow.
+#
+# The full history matters for time travel: on 2015-10-21 TAI-UTC was 36 s,
+# not today's 37 s. Each entry is (Unix second at which the new offset takes
+# effect, TAI-UTC from then on). Before 1972 UTC used "rubber" seconds with
+# fractional offsets, so integer TAI-UTC is undefined there.
 # --------------------------------------------------------------------------
-TAI_MINUS_UTC = 37                      # seconds, TAI - UTC
-GPS_MINUS_UTC = TAI_MINUS_UTC - 19      # seconds, GPS - UTC (= 18)
+LEAP_SECONDS = [
+    (63_072_000, 10),     # 1972-01-01
+    (78_796_800, 11),     # 1972-07-01
+    (94_694_400, 12),     # 1973-01-01
+    (126_230_400, 13),    # 1974-01-01
+    (157_766_400, 14),    # 1975-01-01
+    (189_302_400, 15),    # 1976-01-01
+    (220_924_800, 16),    # 1977-01-01
+    (252_460_800, 17),    # 1978-01-01
+    (283_996_800, 18),    # 1979-01-01
+    (315_532_800, 19),    # 1980-01-01
+    (362_793_600, 20),    # 1981-07-01
+    (394_329_600, 21),    # 1982-07-01
+    (425_865_600, 22),    # 1983-07-01
+    (489_024_000, 23),    # 1985-07-01
+    (567_993_600, 24),    # 1988-01-01
+    (631_152_000, 25),    # 1990-01-01
+    (662_688_000, 26),    # 1991-01-01
+    (709_948_800, 27),    # 1992-07-01
+    (741_484_800, 28),    # 1993-07-01
+    (773_020_800, 29),    # 1994-07-01
+    (820_454_400, 30),    # 1996-01-01
+    (867_715_200, 31),    # 1997-07-01
+    (915_148_800, 32),    # 1999-01-01
+    (1_136_073_600, 33),  # 2006-01-01
+    (1_230_768_000, 34),  # 2009-01-01
+    (1_341_100_800, 35),  # 2012-07-01
+    (1_435_708_800, 36),  # 2015-07-01
+    (1_483_228_800, 37),  # 2017-01-01
+]
+TAI_MINUS_UTC = LEAP_SECONDS[-1][1]     # seconds, TAI - UTC (current)
+GPS_MINUS_UTC = TAI_MINUS_UTC - 19      # seconds, GPS - UTC (current, = 18)
+
+
+def tai_minus_utc_at(unix_s):
+    """TAI-UTC in effect at a given instant, or None before 1972."""
+    value = None
+    for start, offset in LEAP_SECONDS:
+        if unix_s < start:
+            break
+        value = offset
+    return value
+
+
+def gps_minus_utc_at(unix_s):
+    """GPS-UTC in effect at a given instant, or None before the GPS epoch."""
+    tai = tai_minus_utc_at(unix_s)
+    if tai is None or unix_s < GPS_EPOCH_UNIX:
+        return None
+    return tai - 19
 
 # Fixed epoch arithmetic (these never change).
 NTP_UNIX_DELTA = 2_208_988_800          # seconds between 1900-01-01 and 1970-01-01
@@ -102,18 +155,29 @@ def cyan(t):   return c(t, "36")
 def unix_to_ntp64(unix_s):
     """Unix seconds (float) -> 64-bit NTP timestamp (32.32 fixed point)."""
     ntp = unix_s + NTP_UNIX_DELTA
-    sec = int(ntp)
+    sec = math.floor(ntp)
     frac = int(round((ntp - sec) * (1 << 32)))
     if frac == (1 << 32):
         sec, frac = sec + 1, 0
     return ((sec & 0xFFFFFFFF) << 32) | frac
 
 
-def ntp64_to_unix(value):
-    """64-bit NTP timestamp -> Unix seconds (float). Assumes NTP era 0."""
+def ntp64_to_unix(value, pivot=None):
+    """64-bit NTP timestamp -> Unix seconds (float).
+
+    The 32-bit seconds field wraps every 2**32 s (era 0 ends 2036-02-07).
+    The era is disambiguated by picking the one that lands closest to
+    `pivot` (Unix seconds; default: the local clock), so replies keep
+    decoding correctly across the 2036 rollover.
+    """
+    if pivot is None:
+        pivot = time.time()
     sec = value >> 32
     frac = value & 0xFFFFFFFF
-    return sec + frac / (1 << 32) - NTP_UNIX_DELTA
+    era_len = 1 << 32
+    pivot_ntp = pivot + NTP_UNIX_DELTA
+    era = round((pivot_ntp - sec) / era_len)
+    return era * era_len + sec + frac / era_len - NTP_UNIX_DELTA
 
 
 def offset_delay(t1, t2, t3, t4):
@@ -131,11 +195,11 @@ def gps_week_tow(unix_s, leap=None):
     """Unix seconds -> (GPS week number, time-of-week seconds).
 
     GPS time runs ahead of UTC by the leap-second count accrued since 1980
-    (currently GPS_MINUS_UTC). Pass leap=0 to treat the input as already
-    being on the GPS time scale (used by the self-tests).
+    at that instant. Pass leap=0 to treat the input as already being on the
+    GPS time scale (used by the self-tests).
     """
     if leap is None:
-        leap = GPS_MINUS_UTC
+        leap = gps_minus_utc_at(unix_s) or 0
     gps_seconds = (unix_s - GPS_EPOCH_UNIX) + leap
     week = math.floor(gps_seconds / SECS_PER_WEEK)
     tow = gps_seconds - week * SECS_PER_WEEK
@@ -221,8 +285,11 @@ def sntp_query(server, timeout):
     if origin != t1_ntp:
         raise ValueError("origin timestamp mismatch (bogus/spoofed reply)")
 
-    t2 = ntp64_to_unix(struct.unpack_from("!Q", data, 32)[0])
-    t3 = ntp64_to_unix(struct.unpack_from("!Q", data, 40)[0])
+    if leap == 3:
+        raise ValueError("server reports an unsynchronized clock (LI=3)")
+
+    t2 = ntp64_to_unix(struct.unpack_from("!Q", data, 32)[0], pivot=t1)
+    t3 = ntp64_to_unix(struct.unpack_from("!Q", data, 40)[0], pivot=t1)
     offset, delay = offset_delay(t1, t2, t3, t4)
 
     refid = data[12:16]
@@ -339,7 +406,7 @@ def gpsd_query(host="127.0.0.1", port=2947, timeout=3.0):
                         }
         except OSError:
             return "unavailable", None
-    return ("nofix", None) if saw_tpv else ("nofix", None)
+    return "nofix", None
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +415,8 @@ def gpsd_query(host="127.0.0.1", port=2947, timeout=3.0):
 def scales_for(unix_s):
     """Render one instant (Unix seconds, UTC-based) across the major scales."""
     utc = dt.datetime.fromtimestamp(unix_s, dt.timezone.utc)
-    tai = utc + dt.timedelta(seconds=TAI_MINUS_UTC)
+    tai_utc = tai_minus_utc_at(unix_s)
+    gps_utc = gps_minus_utc_at(unix_s)
     week, tow = gps_week_tow(unix_s)
     jd = julian_date(unix_s)
     mjd = jd - MJD_OFFSET
@@ -357,10 +425,12 @@ def scales_for(unix_s):
     iso_year, iso_week, iso_day = utc.isocalendar()
     scales = {
         "utc": utc.strftime("%Y-%m-%d %H:%M:%S.%f") + " UTC",
-        "tai": tai.strftime("%Y-%m-%d %H:%M:%S.%f") + f" TAI (UTC+{TAI_MINUS_UTC}s)",
-        "gps_week": week,
-        "gps_tow": tow,
-        "gps_week_mod1024": week % 1024,
+        "tai": None,
+        "tai_minus_utc_s": tai_utc,
+        "gps_week": None,
+        "gps_tow": None,
+        "gps_week_mod1024": None,
+        "gps_minus_utc_s": gps_utc,
         "unix_s": unix_s,
         "unix_ns": int(round(unix_s * 1e9)),
         "ntp_s": unix_s + NTP_UNIX_DELTA,
@@ -372,6 +442,14 @@ def scales_for(unix_s):
         "day_of_year": int(utc.strftime("%j")),
         "iso_week": f"{iso_year}-W{iso_week:02d}-{iso_day}",
     }
+    if tai_utc is not None:
+        tai = utc + dt.timedelta(seconds=tai_utc)
+        scales["tai"] = (tai.strftime("%Y-%m-%d %H:%M:%S.%f")
+                         + f" TAI (UTC+{tai_utc}s)")
+    if gps_utc is not None:
+        scales["gps_week"] = week
+        scales["gps_tow"] = tow
+        scales["gps_week_mod1024"] = week % 1024
     try:
         local = dt.datetime.fromtimestamp(unix_s).astimezone()
         scales["local"] = local.strftime("%Y-%m-%d %H:%M:%S.%f %Z (UTC%z)")
@@ -397,9 +475,16 @@ def render_scales(scales, indent="  "):
     row("UTC", bold(scales["utc"]))
     if scales.get("local"):
         row("Local", scales["local"])
-    row("TAI", scales["tai"])
-    row("GPS", f"week {scales['gps_week']}, tow {scales['gps_tow']:.6f} s "
-               f"(UTC+{GPS_MINUS_UTC}s; mod-1024 week {scales['gps_week_mod1024']})")
+    if scales["tai"] is not None:
+        row("TAI", scales["tai"])
+    else:
+        row("TAI", dim("n/a — before 1972 UTC had no integer offset from TAI"))
+    if scales["gps_week"] is not None:
+        row("GPS", f"week {scales['gps_week']}, tow {scales['gps_tow']:.6f} s "
+                   f"(UTC+{scales['gps_minus_utc_s']}s; "
+                   f"mod-1024 week {scales['gps_week_mod1024']})")
+    else:
+        row("GPS", dim("n/a — before the GPS epoch (1980-01-06)"))
     row("Unix", f"{scales['unix_s']:.6f} s  |  {scales['unix_ns']} ns")
     row("NTP", f"{scales['ntp_s']:.6f} s since 1900  |  {scales['ntp_hex']}")
     row("Julian", f"JD {scales['jd']:.6f}  ·  MJD {scales['mjd']:.6f}")
@@ -692,7 +777,7 @@ def run_selftest():
     check("Julian Date of the Unix epoch is 2440587.5",
           julian_date(0) == 2440587.5, f"got {julian_date(0)!r}")
 
-    week, tow = gps_week_tow(GPS_EPOCH_UNIX, leap=0)
+    week, tow = gps_week_tow(GPS_EPOCH_UNIX)
     check("GPS epoch maps to week 0, tow 0",
           week == 0 and abs(tow) < 1e-9, f"got week={week} tow={tow}")
 
@@ -725,6 +810,28 @@ def run_selftest():
     slope = linreg_slope([(0, 0.0), (10, 1e-5), (20, 2e-5)])
     check("drift regression recovers 1 ppm exactly",
           abs(slope * 1e6 - 1.0) < 1e-9, f"got {slope * 1e6} ppm")
+
+    check("historical leap seconds: TAI-UTC was 36 s on BTTF day, 37 s now",
+          tai_minus_utc_at(NAMED_INSTANTS["bttf"]) == 36
+          and tai_minus_utc_at(1_700_000_000) == 37
+          and tai_minus_utc_at(0) is None)
+
+    check("GPS-UTC is 0 at the GPS epoch and 17 on BTTF day",
+          gps_minus_utc_at(GPS_EPOCH_UNIX) == 0
+          and gps_minus_utc_at(NAMED_INSTANTS["bttf"]) == 17)
+
+    week, tow = gps_week_tow(NAMED_INSTANTS["bttf"])
+    check("BTTF day is GPS week 1867, tow 318557",
+          week == 1867 and abs(tow - 318557.0) < 1e-6, f"got {week}, {tow}")
+
+    after = NAMED_INSTANTS["ntp-rollover"] + 100.25
+    rt = ntp64_to_unix(unix_to_ntp64(after), pivot=after)
+    check("NTP timestamps decode correctly across the 2036 era rollover",
+          abs(rt - after) < 1e-6, f"got {rt!r}")
+
+    check("--at accepts negative relative jumps like -2d",
+          abs(build_parser().parse_args(normalize_argv(["--at", "-2d"])).at
+              - (time.time() - 2 * 86400)) < 5)
 
     print()
     if failures:
@@ -797,9 +904,34 @@ def build_parser():
     return p
 
 
+def normalize_argv(argv):
+    """Let `--at -2d` (and the documented `--at -- -2d`) work.
+
+    argparse treats any token starting with '-' as an option, so a negative
+    relative jump after --at would otherwise be rejected. Glue the value on
+    as `--at=VALUE`, skipping an optional `--` separator.
+    """
+    out = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--at" and i + 1 < len(argv):
+            j = i + 1
+            if argv[j] == "--" and j + 1 < len(argv):
+                j += 1
+            out.append(f"--at={argv[j]}")
+            i = j + 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def main(argv=None):
     global USE_COLOR
-    args = build_parser().parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    args = build_parser().parse_args(normalize_argv(list(argv)))
     if args.no_color or args.json:
         USE_COLOR = False
     if args.server is None:
